@@ -25,7 +25,7 @@
 
 -export([credentials/3, credentials/4, tables/0,
          key_type/2, key_type/4,
-         key_value/2, key_value/4,
+         key_value/3, key_value/6,
          create_table/4, describe_table/1, remove_table/1,
          get/2, get/3, put/2, update/3, update/4,
          delete/2, delete/3,
@@ -34,8 +34,9 @@
          cond_delete/3, cond_delete/4,
          now/0, find/3, find/4,
          q/3, q/4,
+         index_q/4, index_q/5,
          scan/2, scan/3,
-         range_key_condition/1]).
+         range_key_condition/1, key_conditions/1]).
 
 -define(DDB_DOMAIN, "dynamodb.us-east-1.amazonaws.com").
 -define(DDB_ENDPOINT, "https://" ++ get_ddb_domain() ++ "/").
@@ -57,7 +58,7 @@
 
 %%% Endpoint targets
 
--define(TG_VERSION, "DynamoDB_20111205.").
+-define(TG_VERSION, "DynamoDB_20120810.").
 -define(TG_CREATE_TABLE, ?TG_VERSION ++ "CreateTable").
 -define(TG_LIST_TABLES, ?TG_VERSION ++ "ListTables").
 -define(TG_DESCRIBE_TABLE, ?TG_VERSION ++ "DescribeTable").
@@ -203,24 +204,25 @@ cond_put(Name, Attributes, Condition)
 
 %%% Create a key value, either hash or hash and range.
 
--spec key_value(binary(), type()) -> json().
+-spec key_value(binary(), binary(),type()) -> json().
 
-key_value(HashKeyValue, HashKeyType)
+key_value(HashKeyName, HashKeyValue, HashKeyType)
   when is_binary(HashKeyValue),
+       is_binary(HashKeyName),
        is_atom(HashKeyType) ->
-    [{<<"Key">>, [{<<"HashKeyElement">>,
+    [{<<"Key">>, [{HashKeyName,
                    [{type(HashKeyType), HashKeyValue}]}]}].
 
--spec key_value(binary(), type(), binary(), type()) -> json().
+-spec key_value(binary(), binary(), type(), binary(),binary(), type()) -> json().
 
-key_value(HashKeyValue, HashKeyType, RangeKeyValue, RangeKeyType)
+key_value(HashKeyName, HashKeyValue, HashKeyType, RangeKeyName, RangeKeyValue, RangeKeyType)
   when is_binary(HashKeyValue),
        is_atom(HashKeyType),
        is_binary(RangeKeyValue),
        is_atom(RangeKeyType) ->
-    [{<<"Key">>, [{<<"HashKeyElement">>,
+    [{<<"Key">>, [{HashKeyName,
                    [{type(HashKeyType), HashKeyValue}]},
-                  {<<"RangeKeyElement">>,
+                  {RangeKeyName,
                    [{type(RangeKeyType), RangeKeyValue}]}]}].
 
 %%% Update attributes of an existing item.
@@ -318,8 +320,8 @@ get(Name, Keys)
 get(Name, Keys, Parameters)
   when is_binary(Name),
        is_list(Keys) ->
-    JSON = [{<<"TableName">>, Name}]
-        ++ Keys
+    JSON = [{<<"TableName">>, Name}, 
+            {<<"Key">>,Keys}]
         ++ Parameters,
     request(?TG_GET_ITEM, JSON).
 
@@ -364,6 +366,23 @@ range_key_condition({Condition, RangeKeyType, RangeKeyValues})
     {<<"RangeKeyCondition">>, [{<<"AttributeValueList">>, Values},
                                {<<"ComparisonOperator">>, Op}]}.
 
+-spec key_conditions(find_cond()) -> json_parameter().
+key_conditions({Condition, KeyName, RangeKeyType, RangeKeyValues})
+  when is_atom(Condition),
+       is_atom(RangeKeyType),
+       is_binary(RangeKeyValues),
+       is_binary(KeyName) ->
+    {Op, Values} = case Condition of
+                       'between' ->
+                           [A, B] = RangeKeyValues,
+                           {<<"BETWEEN">>, [[{type(RangeKeyType), A}],
+                                            [{type(RangeKeyType), B}]]};
+                       'equal' ->
+                           {<<"EQ">>, [[{type(RangeKeyType), RangeKeyValues}]]}
+                   end,
+    {<<"KeyConditions">>, [{KeyName, [{<<"AttributeValueList">>, Values},
+                                       {<<"ComparisonOperator">>, Op}]}]}.
+
 %%% Query a table
 
 -spec q(tablename(), key_value(), json_parameters()) -> json_reply().
@@ -375,13 +394,27 @@ q(Name, HashKey, Parameters) ->
 
 -spec q(tablename(), key_value(), json_parameters(), json() | 'none') -> json_reply().
 
-q(Name, {HashKeyValue, HashKeyType}, Parameters, StartKey)
+q(Name, {HashKeyValue, HashKeyType},  Parameters, StartKey)
   when is_binary(Name),
        is_binary(HashKeyValue),
        is_atom(HashKeyType),
        is_list(Parameters) ->
     JSON = [{<<"TableName">>, Name},
             {<<"HashKeyValue">>, [{type(HashKeyType), HashKeyValue}]}]
+        ++ Parameters
+        ++ start_key(StartKey),
+    request(?TG_QUERY, JSON).
+
+index_q(Name, Index, KeyCondition, Parameters) ->
+  index_q(Name, Index, KeyCondition, Parameters, 'none').
+
+index_q(Name, Index, KeyCondition, Parameters, StartKey)
+  when is_binary(Name),
+       is_binary(Index),
+       is_list(Parameters) ->
+    JSON = [{<<"TableName">>, Name},
+            {<<"IndexName">>, Index},
+            key_conditions(KeyCondition)]
         ++ Parameters
         ++ start_key(StartKey),
     request(?TG_QUERY, JSON).
@@ -474,8 +507,9 @@ update_action('delete') -> <<"DELETE">>.
 -spec request(string(), json()) -> json_reply().
 
 request(Target, JSON) ->
+    ok = io:format("REQUEST Terms ~n~p~n", [JSON]),
     Body = jsx:term_to_json(JSON),
-    %%ok = lager:debug("REQUEST BODY ~n~p", [Body]),
+    ok = io:format("REQUEST BODY ~n~p~n", [Body]),
     Headers = headers(Target, Body),
     Opts = [{'response_format', 'binary'}],
     F = fun() -> ibrowse:send_req(?DDB_ENDPOINT, [{'Content-type', ?CONTENT_TYPE} | Headers], 'post', Body, Opts) end,
